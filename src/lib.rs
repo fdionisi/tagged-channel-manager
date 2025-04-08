@@ -1,5 +1,9 @@
+mod channel_id;
+mod error;
+
 use std::{
     collections::HashMap,
+    fmt,
     hash::Hash,
     pin::Pin,
     sync::Arc,
@@ -7,123 +11,151 @@ use std::{
 };
 
 use futures::{
-    channel::mpsc::{self, Receiver, Sender},
+    channel::mpsc::{self, Receiver, SendError, Sender},
     executor::block_on,
     lock::Mutex,
     SinkExt, Stream,
 };
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ChannelId(u64);
+use crate::channel_id::ChannelId;
+pub use error::Error;
 
-pub struct TaggedChannelManager<M, T>(Arc<Mutex<ChannelsInner<M, T>>>);
-
-impl<M, T> Clone for TaggedChannelManager<M, T> {
-    fn clone(&self) -> Self {
-        Self(Arc::clone(&self.0))
-    }
+pub struct TaggedChannelManager<T, M> {
+    inner: Arc<Mutex<Inner<T, M>>>,
 }
 
-pub struct ChannelsInner<M, T> {
-    last_id: ChannelId,
-    channels: HashMap<ChannelId, Channel<M, T>>,
-    tags: HashMap<T, ChannelId>,
+#[derive(Default)]
+struct Inner<T, M> {
+    last_channel_id: ChannelId,
+    channels: HashMap<ChannelId, Channel<T, M>>,
+    channel_id_by_tag: HashMap<T, ChannelId>,
 }
 
-struct Channel<M, T> {
-    tx: Sender<M>,
-    tag: T,
-}
-
-pub struct ChannelGuard<M, T>
+impl<T, M> TaggedChannelManager<T, M>
 where
-    T: Clone + Eq + Hash,
-{
-    channel_id: ChannelId,
-    manager: TaggedChannelManager<M, T>,
-}
-
-pub struct GuardedReceiver<M, T>
-where
-    T: Clone + Eq + Hash,
-{
-    rx: Receiver<M>,
-    #[allow(dead_code)]
-    guard: ChannelGuard<M, T>,
-}
-
-impl<M, T> TaggedChannelManager<M, T>
-where
-    T: Clone + Eq + Hash,
+    T: Clone + Eq + Hash + fmt::Display,
 {
     pub fn new() -> Self {
-        Default::default()
+        TaggedChannelManager::default()
     }
 
-    pub async fn create_channel(&self, tag: T) -> GuardedReceiver<M, T> {
-        let (tx, rx) = mpsc::channel::<M>(1);
-        let mut inner = self.0.lock().await;
-        let channel_id = ChannelId(inner.last_id.0.wrapping_add(1));
-        inner.channels.insert(
-            channel_id,
-            Channel {
-                tx,
-                tag: tag.clone(),
-            },
-        );
-        inner.tags.insert(tag, channel_id);
-        inner.last_id = channel_id;
+    pub async fn open_channel(&self, tag: T) -> Option<GuardedReceiver<T, M>> {
+        let (tx, rx) = mpsc::channel(1);
 
-        GuardedReceiver {
+        let channel = Channel::new(tag.clone(), tx);
+
+        let mut inner = self.inner.lock().await;
+
+        let channel_id = inner.last_channel_id;
+        inner.last_channel_id += 1;
+
+        inner.channels.insert(channel_id, channel);
+        inner.channel_id_by_tag.insert(tag, channel_id);
+
+        Some(GuardedReceiver {
             rx,
             guard: ChannelGuard {
                 channel_id,
                 manager: self.clone(),
             },
-        }
+        })
     }
 
-    pub async fn send_message(&self, tag: &T, message: M) {
-        let inner = self.0.lock().await;
-        if let Some(channel_id) = inner.tags.get(tag) {
-            if let Some(channel) = inner.channels.get(channel_id) {
-                let _ = channel.tx.clone().send(message).await;
-            }
-        }
-    }
+    pub async fn send_message(&self, tag: T, message: M) -> Result<(), Error> {
+        let inner = self.inner.lock().await;
+        let Some(channel_id) = inner.channel_id_by_tag.get(&tag) else {
+            return Err(Error::TagNotFound(tag.to_string()));
+        };
 
-    async fn remove_channel(&self, channel_id: &ChannelId) {
-        let mut inner = self.0.lock().await;
-        if let Some(channel) = inner.channels.remove(channel_id) {
-            inner.tags.remove(&channel.tag);
-        }
+        let Some(channel) = inner.channels.get(channel_id) else {
+            return Err(Error::ChannelNotFound(*channel_id));
+        };
+
+        channel.send(message).await?;
+
+        Ok(())
     }
 }
 
-impl<M, T> Default for TaggedChannelManager<M, T> {
+impl<T, M> Default for TaggedChannelManager<T, M> {
     fn default() -> Self {
-        Self(Arc::new(Mutex::new(ChannelsInner {
-            last_id: ChannelId(0),
-            channels: HashMap::new(),
-            tags: HashMap::new(),
-        })))
+        TaggedChannelManager {
+            inner: Arc::new(Mutex::new(Inner {
+                last_channel_id: ChannelId::default(),
+                channels: HashMap::default(),
+                channel_id_by_tag: HashMap::default(),
+            })),
+        }
     }
 }
 
-impl<M, T> Drop for ChannelGuard<M, T>
+impl<M, T> Clone for TaggedChannelManager<M, T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Channel<T, M> {
+    tag: T,
+    tx: Sender<M>,
+}
+
+impl<T, M> Channel<T, M> {
+    pub fn new(tag: T, tx: Sender<M>) -> Self {
+        Channel {
+            tag: tag.into(),
+            tx,
+        }
+    }
+
+    pub async fn send(&self, message: M) -> Result<(), SendError> {
+        self.tx.clone().send(message).await
+    }
+}
+
+pub struct ChannelGuard<T, M>
+where
+    T: Clone + Eq + Hash,
+{
+    channel_id: ChannelId,
+    manager: TaggedChannelManager<T, M>,
+}
+
+impl<T, M> Drop for ChannelGuard<T, M>
 where
     T: Clone + Eq + Hash,
 {
     fn drop(&mut self) {
+        let channel_id = self.channel_id.clone();
         let manager = self.manager.clone();
-        let channel_id = self.channel_id;
         block_on(async move {
-            manager.remove_channel(&channel_id).await;
+            let mut inner = manager.inner.lock().await;
+            let Some(channel) = inner.channels.remove(&channel_id) else {
+                debug_assert!(false, "tag is already not present in channels");
+                return;
+            };
+
+            let Some(_) = inner.channel_id_by_tag.remove(&channel.tag) else {
+                debug_assert!(false, "tag is already not present in channel_id_by_tag");
+                return;
+            };
         });
     }
 }
 
-impl<M, T> Stream for GuardedReceiver<M, T>
+pub struct GuardedReceiver<T, M>
+where
+    T: Clone + Eq + Hash,
+{
+    rx: Receiver<M>,
+    #[allow(unused)]
+    guard: ChannelGuard<T, M>,
+}
+
+impl<T, M> Stream for GuardedReceiver<T, M>
 where
     T: Clone + Eq + Hash,
 {
@@ -136,52 +168,148 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::thread;
+
     use futures::StreamExt;
 
-    #[tokio::test]
-    async fn test_create_channel() {
-        let manager = TaggedChannelManager::<String, u32>::new();
-        let _receiver = manager.create_channel(1).await;
+    use super::*;
 
-        let inner = manager.0.lock().await;
-        assert_eq!(inner.channels.len(), 1);
-        assert_eq!(inner.tags.len(), 1);
+    #[test]
+    fn it_can_instantiate() {
+        let _: TaggedChannelManager<String, String> = TaggedChannelManager::new();
     }
 
     #[tokio::test]
-    async fn test_send_message() {
-        let manager = TaggedChannelManager::<String, u32>::new();
-        let mut receiver = manager.create_channel(1).await;
+    async fn it_can_create_and_remember_new_channel_with_specific_tag() {
+        let manager: TaggedChannelManager<&str, u8> = TaggedChannelManager::new();
+        let tag = "test";
 
-        manager.send_message(&1, "Hello".to_string()).await;
+        let Some(receiver) = manager.open_channel(tag).await else {
+            panic!("cannot open channel")
+        };
 
-        let message = receiver.next().await;
-        assert_eq!(message, Some("Hello".to_string()));
+        assert_eq!(
+            {
+                let inner = manager.inner.lock().await;
+
+                inner
+                    .channels
+                    .get(&receiver.guard.channel_id)
+                    .map(|channel| channel.tag)
+            },
+            Some("test".into())
+        );
     }
 
     #[tokio::test]
-    async fn test_remove_channel() {
-        let manager = TaggedChannelManager::<String, u32>::new();
-        let receiver = manager.create_channel(1).await;
+    async fn it_can_create_multiple_tag_channel_pairs() {
+        let manager: TaggedChannelManager<&str, u8> = TaggedChannelManager::new();
+        let tag1 = "test1";
+        let tag2 = "test2";
+
+        let Some(receiver1) = manager.open_channel(tag1).await else {
+            panic!("cannot open channel 1")
+        };
+        let Some(receiver2) = manager.open_channel(tag2).await else {
+            panic!("cannot open channel 2")
+        };
+
+        assert_eq!(
+            {
+                let inner = manager.inner.lock().await;
+
+                inner
+                    .channels
+                    .get(&receiver1.guard.channel_id)
+                    .map(|channel| channel.tag)
+            },
+            Some("test1".into())
+        );
+        assert_eq!(
+            {
+                let inner = manager.inner.lock().await;
+
+                inner
+                    .channels
+                    .get(&receiver2.guard.channel_id)
+                    .map(|channel| channel.tag)
+            },
+            Some("test2".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn it_can_send_messages_via_tag() {
+        let manager = TaggedChannelManager::new();
+        let tag = "test";
+        let Some(_receiver) = manager.open_channel(tag).await else {
+            panic!("cannot open channel")
+        };
+
+        let result = manager.send_message(tag, "message").await;
+
+        assert_eq!(result, Ok(()))
+    }
+
+    #[tokio::test]
+    async fn it_fails_sending_messages_via_unexistiting_tag() {
+        let manager = TaggedChannelManager::new();
+        let tag = "test";
+
+        let result = manager.send_message(tag, "message").await;
+
+        assert_eq!(result, Err(Error::TagNotFound(tag.into())))
+    }
+
+    #[tokio::test]
+    async fn it_sends_and_receive_messages() {
+        let manager = TaggedChannelManager::new();
+        let tag = "test";
+        let message = "message";
+        let Some(mut receiver) = manager.open_channel(tag).await else {
+            panic!("can't create channel")
+        };
+
+        let _ = manager.send_message(tag, message).await;
+
+        assert_eq!(receiver.next().await, Some(message))
+    }
+
+    #[tokio::test]
+    async fn it_clean_everything_after_drop() {
+        let manager: TaggedChannelManager<&str, u8> = TaggedChannelManager::new();
+        let tag = "test";
+        let Some(receiver) = manager.open_channel(tag).await else {
+            panic!("can't create channel")
+        };
 
         drop(receiver);
 
-        let inner = manager.0.lock().await;
+        let inner = manager.inner.lock().await;
+
+        assert_eq!(inner.channel_id_by_tag.len(), 0);
         assert_eq!(inner.channels.len(), 0);
-        assert_eq!(inner.tags.len(), 0);
     }
 
     #[tokio::test]
-    async fn test_multiple_channels() {
-        let manager = TaggedChannelManager::<String, u32>::new();
-        let mut receiver1 = manager.create_channel(1).await;
-        let mut receiver2 = manager.create_channel(2).await;
+    async fn it_can_move_through_threads() {
+        let manager: TaggedChannelManager<&str, u8> = TaggedChannelManager::new();
+        let tag = "test";
+        let Some(_receiver) = manager.open_channel(tag).await else {
+            panic!("can't create channel")
+        };
 
-        manager.send_message(&1, "Hello".to_string()).await;
-        manager.send_message(&2, "World".to_string()).await;
-
-        assert_eq!(receiver1.next().await, Some("Hello".to_string()));
-        assert_eq!(receiver2.next().await, Some("World".to_string()));
+        thread::spawn({
+            let manager = manager.clone();
+            move || async move {
+                let tag = "test2";
+                let Some(_receiver) = manager.open_channel(tag).await else {
+                    panic!("can't create channel")
+                };
+            }
+        })
+        .join()
+        .unwrap()
+        .await;
     }
 }
