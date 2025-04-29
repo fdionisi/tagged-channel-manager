@@ -39,7 +39,7 @@ where
         TaggedChannelManager::default()
     }
 
-    pub async fn open_channel(&self, tag: T) -> Option<GuardedReceiver<T, M>> {
+    pub async fn open_channel(&self, tag: T) -> GuardedReceiver<T, M> {
         let (tx, rx) = mpsc::channel(1);
 
         let channel = Channel::new(tag.clone(), tx);
@@ -52,13 +52,13 @@ where
         inner.channels.insert(channel_id, channel);
         inner.channel_id_by_tag.insert(tag, channel_id);
 
-        Some(GuardedReceiver {
+        GuardedReceiver {
             rx,
             guard: ChannelGuard {
                 channel_id,
                 manager: self.clone(),
             },
-        })
+        }
     }
 
     pub async fn send_message(&self, tag: T, message: M) -> Result<(), Error> {
@@ -184,9 +184,7 @@ mod tests {
         let manager: TaggedChannelManager<&str, u8> = TaggedChannelManager::new();
         let tag = "test";
 
-        let Some(receiver) = manager.open_channel(tag).await else {
-            panic!("cannot open channel")
-        };
+        let receiver = manager.open_channel(tag).await;
 
         assert_eq!(
             {
@@ -207,12 +205,8 @@ mod tests {
         let tag1 = "test1";
         let tag2 = "test2";
 
-        let Some(receiver1) = manager.open_channel(tag1).await else {
-            panic!("cannot open channel 1")
-        };
-        let Some(receiver2) = manager.open_channel(tag2).await else {
-            panic!("cannot open channel 2")
-        };
+        let receiver1 = manager.open_channel(tag1).await;
+        let receiver2 = manager.open_channel(tag2).await;
 
         assert_eq!(
             {
@@ -242,9 +236,7 @@ mod tests {
     async fn it_can_send_messages_via_tag() {
         let manager = TaggedChannelManager::new();
         let tag = "test";
-        let Some(_receiver) = manager.open_channel(tag).await else {
-            panic!("cannot open channel")
-        };
+        let _receiver = manager.open_channel(tag).await;
 
         let result = manager.send_message(tag, "message").await;
 
@@ -266,9 +258,7 @@ mod tests {
         let manager = TaggedChannelManager::new();
         let tag = "test";
         let message = "message";
-        let Some(mut receiver) = manager.open_channel(tag).await else {
-            panic!("can't create channel")
-        };
+        let mut receiver = manager.open_channel(tag).await;
 
         let _ = manager.send_message(tag, message).await;
 
@@ -279,9 +269,7 @@ mod tests {
     async fn it_clean_everything_after_drop() {
         let manager: TaggedChannelManager<&str, u8> = TaggedChannelManager::new();
         let tag = "test";
-        let Some(receiver) = manager.open_channel(tag).await else {
-            panic!("can't create channel")
-        };
+        let receiver = manager.open_channel(tag).await;
 
         drop(receiver);
 
@@ -295,17 +283,13 @@ mod tests {
     async fn it_can_move_through_threads() {
         let manager: TaggedChannelManager<&str, u8> = TaggedChannelManager::new();
         let tag = "test";
-        let Some(_receiver) = manager.open_channel(tag).await else {
-            panic!("can't create channel")
-        };
+        let _receiver = manager.open_channel(tag).await;
 
         thread::spawn({
             let manager = manager.clone();
             move || async move {
                 let tag = "test2";
-                let Some(_receiver) = manager.open_channel(tag).await else {
-                    panic!("can't create channel")
-                };
+                let _receiver = manager.open_channel(tag).await;
             }
         })
         .join()
